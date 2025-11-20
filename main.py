@@ -1,7 +1,6 @@
 # main.py
 import flet as ft
-from services import db  # Para refrescar el usuario desde la BD
-
+from services import db  # <- IMPORTANTE: para refrescar el usuario desde la BD
 
 # --- Helpers de import seguro para evitar NameError / ImportError ---
 def _safe_import(view_import, placeholder_title: str):
@@ -19,13 +18,9 @@ def _safe_import(view_import, placeholder_title: str):
                     ),
                     ft.Text(
                         "Revisa imports/rutas en main.py o crea la vista correspondiente.",
-                        size=12,
-                        color="#94a3b8",
+                        size=12, color="#94a3b8",
                     ),
-                    ft.ElevatedButton(
-                        "Volver al Dashboard",
-                        on_click=lambda e: page.go("/dashboard"),
-                    ),
+                    ft.ElevatedButton("Volver al Dashboard", on_click=lambda e: page.go("/dashboard")),
                 ],
                 spacing=10,
             )
@@ -34,12 +29,10 @@ def _safe_import(view_import, placeholder_title: str):
                 appbar=ft.AppBar(title=ft.Text("Aviso"), bgcolor="#FFFFFF"),
                 controls=[ft.Container(body, padding=16)],
             )
-
         return _placeholder_view
 
-
 # Importa vistas con fallback
-dashboard_view = _safe_import(
+dashboard_view    = _safe_import(
     lambda: __import__("pages.dashboard", fromlist=["dashboard_view"]).dashboard_view,
     "Dashboard no disponible",
 )
@@ -47,56 +40,54 @@ subscription_view = _safe_import(
     lambda: __import__("pages.subscription", fromlist=["subscription_view"]).subscription_view,
     "Suscripciones no disponible",
 )
-pets_view = _safe_import(
+pets_view         = _safe_import(
     lambda: __import__("pages.pets", fromlist=["pets_view"]).pets_view,
     "Mascotas no disponible",
 )
-owner_view = _safe_import(
+owner_view        = _safe_import(
     lambda: __import__("pages.owner", fromlist=["owner_view"]).owner_view,
     "Owner no disponible",
 )
-login_view = _safe_import(
+login_view        = _safe_import(
     lambda: __import__("pages.login", fromlist=["login_view"]).login_view,
     "Login no disponible",
+)
+register_view     = _safe_import(
+    lambda: __import__("pages.register", fromlist=["register_view"]).register_view,
+    "Registro no disponible",
 )
 
 
 def main(page: ft.Page):
-    # Inicializa BD por si hace falta
-    try:
-        db.init_db()
-    except Exception:
-        pass
 
-    # Navegación hacia atrás (AppBar back / Android back)
-    def view_pop(e: ft.ViewPopEvent):
+    # Guarda la ruta anterior para back navigation si lo usas
+    def view_pop(view):
         if len(page.views) > 1:
             page.views.pop()
             page.go(page.views[-1].route)
-
     page.on_view_pop = view_pop
 
-    # Helper: obtener usuario actualizado desde la BD
-    def _get_fresh_user():
-        session_user = page.session.get("user")
-        if not session_user or not session_user.get("id"):
-            return None
-
-        try:
-            fresh = db.get_user_by_id(session_user["id"])
-        except Exception:
-            fresh = None
-
-        if fresh:
-            # Actualiza sesión con los datos recién sacados de la BD
-            page.session.set("user", fresh)
-            return fresh
-        return session_user
-
-    def route_change(e: ft.RouteChangeEvent):
+    def route_change(_):
         page.views.clear()
 
-        user = _get_fresh_user()
+        # ----- REFRESCAR USUARIO DESDE LA BD -----
+        session_user = page.session.get("user")
+        user = None
+        if session_user and session_user.get("id"):
+            try:
+                fresh = db.get_user_by_id(session_user["id"])
+            except Exception:
+                fresh = None
+
+            if fresh:
+                # Actualiza sesión con los datos recién sacados de la BD
+                page.session.set("user", fresh)
+                user = fresh
+            else:
+                user = session_user
+        else:
+            user = None
+        # -----------------------------------------
 
         # Alias: singular -> plural
         if page.route == "/subscription":
@@ -112,38 +103,24 @@ def main(page: ft.Page):
             page.update()
             return
 
+        # Router
         r = page.route
-
-        if r == "/":
-            # Si ya está logueado, lo mandamos al dashboard; si no, al login
-            if user:
-                page.views.append(dashboard_view(page))
-            else:
-                page.views.append(login_view(page))
-
-        elif r == "/dashboard":
+        if r == "/" or r == "/dashboard":
             page.views.append(dashboard_view(page))
-
         elif r == "/pets":
             page.views.append(pets_view(page))
-
-        elif r == "/subscriptions":  # ← plural
+        elif r == "/subscriptions":             # ← plural
             page.views.append(subscription_view(page))
-
         elif r == "/owner":
             # Solo admin
             if user and user.get("role") == "admin":
                 page.views.append(owner_view(page))
             else:
                 page.views.append(dashboard_view(page))
-
         elif r == "/login":
-            # Si ya hay sesión y entra a /login, mejor mostrar dashboard
-            if user:
-                page.views.append(dashboard_view(page))
-            else:
-                page.views.append(login_view(page))
-
+            page.views.append(login_view(page))
+        elif r == "/register":
+            page.views.append(register_view(page))
         else:
             # Ruta desconocida: si hay sesión, manda a dashboard; si no, a login
             page.views.append(dashboard_view(page) if user else login_view(page))
