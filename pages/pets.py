@@ -31,6 +31,7 @@ def _platform_str(page: ft.Page) -> str:
         return v.lower()
     return str(p).lower()
 
+
 def _default_photo(page: ft.Page) -> str:
     """Devuelve un path válido según plataforma."""
     if _platform_str(page) == "web":
@@ -47,6 +48,7 @@ def _open_dialog(page: ft.Page, dlg: ft.AlertDialog):
         page.dialog = dlg     # Flet antiguos
         dlg.open = True
         page.update()
+
 
 def _close_dialog(page: ft.Page, dlg: ft.AlertDialog):
     try:
@@ -192,12 +194,15 @@ def _pets_impl(page: ft.Page) -> ft.View:
     # ------- Estado -------
     list_col = ft.Column(spacing=12, expand=True)
 
+    # Estado para saber si se puede agregar (lo usa View.floating_action_button)
+    can_add_state: dict[str, bool] = {"value": False}
+
     # FilePicker único (lo ponemos en overlay si no estaba)
     file_picker = ft.FilePicker()
     if file_picker not in page.overlay:
         page.overlay.append(file_picker)
 
-    # ------- Popups: QR y Mapa (sin WebView, con cierre garantizado) -------
+    # ------- Popups: QR y Mapa -------
 
     def _qr_image_for(text: str, size: int = 240) -> ft.Image:
         """
@@ -207,7 +212,7 @@ def _pets_impl(page: ft.Page) -> ft.View:
         try:
             import qrcode
             from PIL import Image
-            import io, base64 as _b64
+            import io as _io, base64 as _b64
 
             qr = qrcode.QRCode(
                 version=None,  # auto
@@ -219,7 +224,7 @@ def _pets_impl(page: ft.Page) -> ft.View:
             qr.make(fit=True)
             img: Image.Image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
             img = img.resize((size, size))
-            buf = io.BytesIO()
+            buf = _io.BytesIO()
             img.save(buf, format="PNG", optimize=True)
             b64 = _b64.b64encode(buf.getvalue()).decode("utf-8")
             return ft.Image(src_base64=b64, width=size, height=size)
@@ -228,90 +233,84 @@ def _pets_impl(page: ft.Page) -> ft.View:
             url = "https://chart.googleapis.com/chart?cht=qr&chs=" + f"{size}x{size}" + "&chl=" + _url.quote(text)
             return ft.Image(src=url, width=size, height=size)
 
-    def open_qr(pid: int):
-        """
-        1) Si hay ngrok activo, pide al server /qr-url/<pid> usando la URL pública actual.
-        2) Si no, cae a payload offline (PETTOKEN:...).
-        """
-        payload = None
-
-        base = _current_public_base()   # <- AHORA se refresca sola cada vez
-        if base:
-            try:
-                with urllib.request.urlopen(f"{base}/qr-url/{pid}", timeout=5) as r:
-                    data = json.loads(r.read().decode("utf-8"))
-                    if isinstance(data, dict) and data.get("url"):
-                        payload = data["url"]
-            except Exception:
-                payload = None
-
-        if not payload:
-            # fallback local/offline (token estable pero sin URL pública)
-            payload = db.get_pet_qr_payload(pid)
-
-        img = _qr_image_for(payload, size=240)
-        dlg = ft.AlertDialog(
-            title=ft.Text("QR de la mascota"),
-            content=ft.Column(
-                [img, ft.Text(payload, size=12, color=MUTED, selectable=True)],
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=10,
-                width=280,
-            ),
-            actions=[ft.TextButton("Cerrar", on_click=lambda e: _close_dialog(page, dlg))],
-            actions_alignment=ft.MainAxisAlignment.END,
-            modal=True,
-        )
-        _open_dialog(page, dlg)
-
     def open_map(pid: int):
         """
-        Mapa como imagen estática + botón para abrir Google Maps.
-        Sin WebView, sin inputs de coordenadas.
-        Fallback a Santiago si no hay coords.
+        Muestra un mapa PRECISO usando un WebView con OpenStreetMap embebido
+        y un botón para abrir la misma ubicación en Google Maps.
+        NO pasa por /static-map ni por tu servidor para el mapa.
         """
+        # Coordenadas por defecto (Santiago) si la mascota aún no tiene ubicación
         lat, lng = -33.4489, -70.6693
         try:
             if hasattr(db, "get_pet"):
                 info = db.get_pet(pid) or {}
-                lat = float(info.get("last_lat", lat))
-                lng = float(info.get("last_lng", lng))
+                if info.get("last_lat") is not None and info.get("last_lng") is not None:
+                    lat = float(info.get("last_lat"))
+                    lng = float(info.get("last_lng"))
         except Exception:
             pass
 
-        static_map = (
-            "https://maps.google.com/maps/api/staticmap?"
-            f"center={lat},{lng}&zoom=15&size=400x260&maptype=roadmap"
-            f"&markers=color:red%7C{lat},{lng}"
+        # Link a Google Maps con la ubicación real
+        gmaps_link = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+
+        # ---------- URL embebida de OpenStreetMap ----------
+        # Calculamos una bbox pequeñita alrededor del punto
+        dlat = 0.01
+        dlng = 0.01
+        left   = lng - dlng
+        bottom = lat - dlat
+        right  = lng + dlng
+        top    = lat + dlat
+
+        bbox = f"{left},{bottom},{right},{top}"
+        # Mapa embebido con marcador en la posición de la mascota
+        osm_embed_url = (
+            "https://www.openstreetmap.org/export/embed.html"
+            f"?bbox={_url.quote(bbox)}"
+            f"&layer=mapnik"
+            f"&marker={lat},{lng}"
         )
-        gmaps_link = f"https://maps.google.com/?q={lat},{lng}&z=16"
+
+        # WebView con el mapa (preciso y cargado directamente desde OSM)
+        map_view = ft.WebView(
+            url=osm_embed_url,
+            width=420,
+            height=280,
+        )
 
         dlg = ft.AlertDialog(
             title=ft.Text("Ubicación"),
             content=ft.Column(
                 [
-                    ft.Image(src=static_map, width=400, height=260, fit=ft.ImageFit.CONTAIN),
+                    map_view,
+                    ft.Text(
+                        f"Lat/Lng: {lat:.6f}, {lng:.6f}",
+                        size=11,
+                        color=MUTED,
+                    ),
                     ft.Row(
                         [
                             ft.FilledButton(
                                 "Abrir en Google Maps",
                                 icon="open_in_new",
                                 on_click=lambda e: page.launch_url(gmaps_link),
-                            ),
+                            )
                         ],
                         alignment=ft.MainAxisAlignment.END,
                     ),
                 ],
-                spacing=8,
-                width=420,
+                spacing=10,
+                width=440,
             ),
-            actions=[ft.TextButton("Cerrar", on_click=lambda e: _close_dialog(page, dlg))],
+            actions=[
+                ft.TextButton("Cerrar", on_click=lambda e: _close_dialog(page, dlg)),
+            ],
             actions_alignment=ft.MainAxisAlignment.END,
             modal=True,
         )
         _open_dialog(page, dlg)
 
-    # ------- Diálogo: Renombrar (se cierra bien) -------
+    # ------- Diálogo: Renombrar -------
 
     def open_rename_dialog(pet_id: int, current_name: str):
         name_field = ft.TextField(label="Nuevo nombre", value=current_name or "", autofocus=True, width=320)
@@ -334,7 +333,11 @@ def _pets_impl(page: ft.Page) -> ft.View:
             content=ft.Column([name_field, msg], spacing=8),
             actions=[
                 ft.TextButton("Cancelar", on_click=lambda e: _close_dialog(page, dlg)),
-                ft.ElevatedButton("Guardar", on_click=save, style=ft.ButtonStyle(bgcolor=PRIMARY, color="#FFFFFF")),
+                ft.ElevatedButton(
+                    "Guardar",
+                    on_click=save,
+                    style=ft.ButtonStyle(bgcolor=PRIMARY, color="#FFFFFF"),
+                ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
@@ -345,14 +348,26 @@ def _pets_impl(page: ft.Page) -> ft.View:
     def _status_chip(status: str) -> ft.Control:
         s = (status or "").lower()
         if s == "active":
-            return ft.Container(ft.Text("Activa", color="#065f46"), bgcolor="#d1fae5",
-                                padding=ft.padding.symmetric(4, 8), border_radius=100)
+            return ft.Container(
+                ft.Text("Activa", color="#065f46"),
+                bgcolor="#d1fae5",
+                padding=ft.padding.symmetric(4, 8),
+                border_radius=100,
+            )
         if s == "pending":
-            return ft.Container(ft.Text("Pendiente", color="#92400e"), bgcolor="#fef3c7",
-                                padding=ft.padding.symmetric(4, 8), border_radius=100)
+            return ft.Container(
+                ft.Text("Pendiente", color="#92400e"),
+                bgcolor="#fef3c7",
+                padding=ft.padding.symmetric(4, 8),
+                border_radius=100,
+            )
         if s == "inactive":
-            return ft.Container(ft.Text("Inactiva", color="#6b7280"), bgcolor="#e5e7eb",
-                                padding=ft.padding.symmetric(4, 8), border_radius=100)
+            return ft.Container(
+                ft.Text("Inactiva", color="#6b7280"),
+                bgcolor="#e5e7eb",
+                padding=ft.padding.symmetric(4, 8),
+                border_radius=100,
+            )
         return ft.Container()
 
     def _pet_tile(pid: int, name: str, breed: str, photo: str | None, status: str = "active") -> ft.Control:
@@ -369,23 +384,40 @@ def _pets_impl(page: ft.Page) -> ft.View:
             expand=True,
         )
 
+        s = (status or "").lower()
+        is_active = (s == "active")
+
         title_row = ft.Row(
             [
-                ft.Text(name or "Sin nombre", weight=ft.FontWeight.BOLD,
-                        overflow=ft.TextOverflow.ELLIPSIS, expand=True),
+                ft.Text(
+                    name or "Sin nombre",
+                    weight=ft.FontWeight.BOLD,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                    expand=True,
+                ),
                 _status_chip(status),
             ],
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
+        # Botones: activos solo si la mascota está activa
+        if is_active:
+            map_btn = ft.FilledButton("Mapa", icon="location_on", on_click=lambda e, _pid=pid: open_map(_pid))
+            qr_btn = ft.FilledButton("QR", icon="qr_code_2", on_click=lambda e, _pid=pid: open_qr(_pid))
+            rename_btn = ft.OutlinedButton(
+                "Renombrar",
+                icon="edit",
+                on_click=lambda e, _pid=pid, _n=name: open_rename_dialog(_pid, _n),
+            )
+        else:
+            # Inactiva → botones deshabilitados, sin on_click
+            map_btn = ft.FilledButton("Mapa", icon="location_on", disabled=True)
+            qr_btn = ft.FilledButton("QR", icon="qr_code_2", disabled=True)
+            rename_btn = ft.OutlinedButton("Renombrar", icon="edit", disabled=True)
+
         actions_row = ft.Row(
-            [
-                ft.FilledButton("Mapa", icon="location_on", on_click=lambda e, _pid=pid: open_map(_pid)),
-                ft.FilledButton("QR", icon="qr_code_2", on_click=lambda e, _pid=pid: open_qr(_pid)),
-                ft.OutlinedButton("Renombrar", icon="edit",
-                                  on_click=lambda e, _pid=pid, _n=name: open_rename_dialog(_pid, _n)),
-            ],
+            [map_btn, qr_btn, rename_btn],
             alignment=ft.MainAxisAlignment.END,
             spacing=8,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -414,11 +446,10 @@ def _pets_impl(page: ft.Page) -> ft.View:
 
     def open_add_pet(_=None):
         """Crear mascota con foto opcional (flujo con aprobación)."""
-        # Verificación previa (respeta Basic=1 con pendientes y bloqueo en Plus)
+        # Verificación previa (respeta límites de plan)
         try:
             ok, reason = db.can_user_add_pet(user_id)
             if not ok:
-                # Aviso rápido y aborta abrir el diálogo
                 sb = ft.SnackBar(ft.Text(reason or "No puedes crear una nueva mascota ahora."))
                 page.overlay.append(sb)
                 sb.open = True
@@ -499,7 +530,7 @@ def _pets_impl(page: ft.Page) -> ft.View:
         def pick_image(_):
             file_picker.pick_files(
                 allowed_extensions=["jpg", "jpeg", "png", "webp"],
-                allow_multiple=False
+                allow_multiple=False,
             )
 
         def save(_):
@@ -525,20 +556,27 @@ def _pets_impl(page: ft.Page) -> ft.View:
         content = ft.Column(
             [
                 ft.Text("Nueva mascota", size=18, weight=ft.FontWeight.BOLD),
-                ft.Row([ft.OutlinedButton("Seleccionar foto", icon="image", on_click=pick_image)],
-                       alignment=ft.MainAxisAlignment.START),
+                ft.Row(
+                    [ft.OutlinedButton("Seleccionar foto", icon="image", on_click=pick_image)],
+                    alignment=ft.MainAxisAlignment.START,
+                ),
                 preview_box,
                 info,
-                name, breed,
+                name,
+                breed,
                 ft.Row(
                     [
-                        ft.ElevatedButton("Guardar", on_click=save,
-                                          style=ft.ButtonStyle(bgcolor=PRIMARY, color="#FFFFFF")),
+                        ft.ElevatedButton(
+                            "Guardar",
+                            on_click=save,
+                            style=ft.ButtonStyle(bgcolor=PRIMARY, color="#FFFFFF"),
+                        ),
                         ft.TextButton("Cancelar", on_click=cancel),
                     ],
                     alignment=ft.MainAxisAlignment.END,
                 ),
-                msg_ok, msg_err,
+                msg_ok,
+                msg_err,
             ],
             spacing=10,
             width=360,
@@ -569,6 +607,9 @@ def _pets_impl(page: ft.Page) -> ft.View:
             can_add, reason = db.can_user_add_pet(user_id)
         except Exception:
             pass
+
+        # guarda estado para el View inicial
+        can_add_state["value"] = bool(can_add)
 
         # Si NO puede crear, mostramos una banda informativa arriba del listado
         if not can_add and reason:
@@ -626,7 +667,7 @@ def _pets_impl(page: ft.Page) -> ft.View:
                                         ft.Text(
                                             f"Tienes {pend} mascota(s) en revisión. "
                                             f"Serán visibles cuando el administrador las apruebe.",
-                                            size=12
+                                            size=12,
                                         ),
                                     ],
                                     spacing=8,
@@ -641,20 +682,28 @@ def _pets_impl(page: ft.Page) -> ft.View:
             for pid, name, breed, photo, status in rows:
                 list_col.controls.append(_pet_tile(pid, name, breed, photo, status))
 
-        # FAB acorde a permiso de creación
-        page.floating_action_button = (
-            ft.FloatingActionButton(icon="add", bgcolor=PRIMARY, on_click=open_add_pet) if can_add else None
-        )
+        # Actualizar FAB del View actual (después de que la vista ya exista)
+        fab = ft.FloatingActionButton(icon="add", bgcolor=PRIMARY, on_click=open_add_pet) if can_add else None
+        if page.views and page.views[-1].route == "/pets":
+            page.views[-1].floating_action_button = fab
 
         page.update()
 
+    # Construye contenido inicial
     reload_list()
+
+    # FAB inicial para la vista (primer render)
+    initial_fab = (
+        ft.FloatingActionButton(icon="add", bgcolor=PRIMARY, on_click=open_add_pet)
+        if can_add_state["value"]
+        else None
+    )
 
     return ft.View(
         "/pets",
         appbar=appbar,
         controls=[ft.Container(list_col, padding=12, expand=True)],
-        floating_action_button=None,  # lo setea reload_list() según permiso
+        floating_action_button=initial_fab,
     )
 
 
@@ -666,6 +715,7 @@ def pets_view(page: ft.Page) -> ft.View:
         return _pets_impl(page)
     except Exception as e:
         return _error_view(page, "pets_view", e)
+
 
 def _current_public_base() -> str | None:
     """

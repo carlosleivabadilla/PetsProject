@@ -1,3 +1,4 @@
+# services/db.py
 import sqlite3, os, hashlib, uuid, secrets
 import json, urllib.request  # <- agrega esto
 
@@ -166,24 +167,26 @@ def count_user_active_plus_pending_pets(user_id: int) -> int:
         return int(row[0] if row else 0)
 
 def can_user_add_pet(user_id: int):
-    """Devuelve (ok, reason). 
-    - Bloquea creación desde la app si el plan es 'Plus'.
-    - Valida contra el límite usando ACTIVAS + PENDIENTES (no solo activas).
+    """Devuelve (ok, reason).
+
+    Valida contra el límite del plan usando ACTIVAS + PENDIENTES (no solo activas).
+    Free: 0, Basic: 1, Plus: 5. Admin/Owner sin límite.
     """
     plan, role = _get_user_plan_role(user_id)
-    if role == "admin" or plan == "Owner":
+
+    # Admin y Owner sin límite
+    if role == "admin" or (plan or "").strip() == "Owner":
         return True, None
 
-    # Regla pedida: en PLUS no se envían solicitudes de creación desde la app
-    if (plan or "").strip() == "Plus":
-        return False, "Tu plan Plus no permite crear nuevas solicitudes desde la app."
-
     limit = plan_limit(plan)
-    total = count_user_active_plus_pending_pets(user_id)  # <= aquí cambiamos a activas+pendientes
-    if total >= limit:
-        return False, f"Tu plan ({plan}) permite hasta {limit} mascota(s) activas o en revisión."
-    return True, None
+    total = count_user_active_plus_pending_pets(user_id)
 
+    if total >= limit:
+        if limit == 0:
+            return False, "Tu plan actual no permite registrar mascotas. Mejora tu plan para poder agregar una."
+        return False, f"Tu plan ({plan}) permite hasta {limit} mascota(s) activas o en revisión."
+
+    return True, None
 
 def can_user_downgrade_to(user_id: int, new_plan: str) -> tuple[bool, str | None]:
     """Evita bajar a un plan con menos cupo del que ya tiene activo."""
@@ -273,6 +276,25 @@ def delete_user_pets(user_id: int):
     with _conn() as conn:
         conn.execute("DELETE FROM pets WHERE user_id=?", (user_id,))
         conn.commit()
+
+def get_user_by_id(user_id: int):
+    """Devuelve el usuario “fresco” desde la BD (id, email, plan, role, name, phone)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, email, plan, role, name, phone FROM users WHERE id=?",
+            (user_id,)
+        ).fetchone()
+        if not row:
+            return None
+        uid, email, plan, role, name, phone = row
+        return {
+            "id": uid,
+            "email": email,
+            "plan": plan or "Free",
+            "role": role or "user",
+            "name": name or "",
+            "phone": phone or "",
+        }
 
 # =========================
 # Pets (con estados)
@@ -520,7 +542,6 @@ def get_pet_with_owner(pid: int):
 # “Checkout” simulado
 # =========================
 
-# cambia la firma y el uso de base_url
 def create_checkout_order(user_id: int, target_plan: str, amount_cents: int = 0) -> tuple[bool, str | None, str | None]:
     """
     Crea una orden 'pending' y devuelve (ok, checkout_url, error).
@@ -562,27 +583,42 @@ def create_checkout_order(user_id: int, target_plan: str, amount_cents: int = 0)
     return True, checkout_url, None
 
 def mark_purchase_paid(external_id: str) -> tuple[bool, str | None]:
-    """Marca compra pagada y aplica el plan al usuario."""
+    """
+    Marca compra pagada y aplica el plan al usuario **usando change_user_plan**,
+    de modo que:
+      - Se reactiven mascotas inactivas hasta el cupo del nuevo plan.
+      - Se desactiven las sobrantes si corresponde.
+    """
     with _conn() as conn:
         row = conn.execute(
             "SELECT id, user_id, target_plan, status FROM purchases WHERE external_id=?",
             (external_id,)
         ).fetchone()
-        if not row:
-            return False, "Orden no encontrada."
-        pid, uid, target_plan, status = row
-        if status == "paid":
-            return True, None
-        if status == "canceled":
-            return False, "La orden fue cancelada."
 
-        ok, _ = can_user_downgrade_to(uid, target_plan)  # chequeo suave
-        # (Si no OK y es upgrade, igual aplicamos; aquí solo señalamos potencial conflicto)
+    if not row:
+        return False, "Orden no encontrada."
 
-        conn.execute("UPDATE users SET plan=? WHERE id=?", (target_plan, uid))
+    pid, uid, target_plan, status = row
+
+    # Si ya está pagada, no repetimos cambios; asumimos que el plan ya se aplicó.
+    if status == "paid":
+        return True, None
+
+    if status == "canceled":
+        return False, "La orden fue cancelada."
+
+    # Usa la lógica centralizada (reactiva inactivas, respeta límites, etc.)
+    ok, err, _stats = change_user_plan(uid, target_plan)
+    if not ok:
+        return False, err or "No se pudo aplicar el nuevo plan."
+
+    # Marca la compra como pagada
+    with _conn() as conn:
         conn.execute("UPDATE purchases SET status='paid' WHERE id=?", (pid,))
         conn.commit()
-        return True, None
+
+    return True, None
+
 
 def cancel_purchase(external_id: str):
     with _conn() as conn:
@@ -631,7 +667,6 @@ def get_or_create_qr_token(pet_id: int) -> str:
         if tok:
             return tok
         # crea token nuevo cuidando colisiones (por índice único)
-        import secrets
         while True:
             tok = secrets.token_hex(16)
             try:
@@ -639,7 +674,6 @@ def get_or_create_qr_token(pet_id: int) -> str:
                 conn.commit()
                 return tok
             except Exception:
-                # si colisiona, reintenta
                 continue
 
 def _rank_order():
@@ -647,14 +681,6 @@ def _rank_order():
 
 def _plan_limit(plan: str) -> int:
     return _PLAN_LIMITS.get(plan, 0)
-
-def count_user_active_pets(user_id: int) -> int:
-    with _conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM pets WHERE user_id=? AND status='active'",
-            (user_id,)
-        ).fetchone()
-        return int(row[0] if row else 0)
 
 def _list_active_pet_ids_ordered(conn, user_id: int):
     """
@@ -717,61 +743,6 @@ def enforce_plan_limits(user_id: int, plan: str) -> tuple[int, int]:
             conn.commit()
         return limit, len(drop)
 
-def change_user_plan(user_id: int, new_plan: str) -> tuple[bool, str | None, dict]:
-    new_plan = (new_plan or "Free").strip()
-    with _conn() as conn:
-        role_row = conn.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
-        if not role_row:
-            return False, "Usuario no existe.", {}
-        role = role_row[0]
-        if role == "admin":
-            return False, "El admin no necesita cambiar plan.", {}
-
-        conn.execute("UPDATE users SET plan=? WHERE id=?", (new_plan, user_id))
-        conn.commit()
-
-    # Antes de ajustar exceso, intentamos reactivar hasta llenar cupo del nuevo plan
-    activated = reactivate_up_to_plan_limit(user_id, new_plan)
-
-    active_before = count_user_active_pets(user_id)
-    active_after, deactivated = enforce_plan_limits(user_id, new_plan)
-
-    return True, None, {
-        "activated": activated if activated is not None else max(active_after - max(active_before, 0), 0),
-        "deactivated": deactivated,
-        "final_plan": new_plan
-    }
-
-
-    # Enforce límites
-    active_before = count_user_active_pets(user_id)
-    active_after, deactivated = enforce_plan_limits(user_id, new_plan)
-    return True, None, {"activated": max(active_after - max(active_before, 0), 0), "deactivated": deactivated, "final_plan": new_plan}
-
-def apply_plan_change_by_token(external_id: str, target_plan: str) -> tuple[bool, str | None, dict]:
-    """
-    Cambia el plan asociado a un token de 'purchases' (sin cobro), útil para downgrades/cancel.
-    Marca la purchase como 'paid' para cerrar el flujo.
-    """
-    with _conn() as conn:
-        row = conn.execute(
-            "SELECT id, user_id, status FROM purchases WHERE external_id=?",
-            (external_id,)
-        ).fetchone()
-        if not row:
-            return False, "Orden no encontrada.", {}
-        pid, uid, status = row
-
-    ok, err, stats = change_user_plan(uid, target_plan)
-    if not ok:
-        return False, err, stats
-
-    with _conn() as conn:
-        conn.execute("UPDATE purchases SET status='paid' WHERE external_id=?", (external_id,))
-        conn.commit()
-
-    return True, None, stats
-
 def _list_inactive_pet_ids_ordered(conn, user_id: int):
     """
     IDs de mascotas inactivas ordenadas (más recientes primero) para reactivar primero las últimas.
@@ -821,3 +792,99 @@ def reactivate_up_to_plan_limit(user_id: int, plan: str | None = None) -> int:
         conn.executemany("UPDATE pets SET status='active', approved_at=datetime('now') WHERE id=?", [(i,) for i in ids])
         conn.commit()
         return len(ids)
+
+def change_user_plan(user_id: int, new_plan: str) -> tuple[bool, str | None, dict]:
+    """
+    Cambia el plan del usuario y ajusta sus mascotas:
+    - Si el plan tiene cupo > 0, intenta reactivar mascotas inactivas
+      (las más recientes primero) hasta llenar el cupo.
+    - Si hay más activas de las permitidas, desactiva las más antiguas.
+    Devuelve (ok, error, stats) donde stats = {"activated", "deactivated", "final_plan"}.
+    """
+    new_plan = (new_plan or "Free").strip()
+
+    # Cambiamos el plan en la tabla users
+    with _conn() as conn:
+        role_row = conn.execute("SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
+        if not role_row:
+            return False, "Usuario no existe.", {}
+        role = role_row[0]
+        if role == "admin":
+            return False, "El admin no necesita cambiar plan.", {}
+
+        conn.execute("UPDATE users SET plan=? WHERE id=?", (new_plan, user_id))
+        conn.commit()
+
+    # 1) Intentar reactivar mascotas inactivas hasta llenar el cupo del nuevo plan
+    activated = reactivate_up_to_plan_limit(user_id, new_plan)
+
+    # 2) Enforce de límites por si, por alguna razón, quedamos pasados de cupo
+    active_before = count_user_active_pets(user_id)
+    active_after, deactivated = enforce_plan_limits(user_id, new_plan)
+
+    return True, None, {
+        "activated": activated if activated is not None else max(active_after - max(active_before, 0), 0),
+        "deactivated": deactivated,
+        "final_plan": new_plan,
+    }
+
+def reactivate_up_to_plan_limit(user_id: int, plan: str | None = None) -> int:
+    """
+    Reactiva, si corresponde, mascotas 'inactive' hasta completar el cupo del plan.
+    Devuelve cuántas se reactivaron.
+    """
+    if plan is None:
+        plan, role = _get_user_plan_role(user_id)
+    else:
+        role = _get_user_plan_role(user_id)[1]
+
+    if role == "admin" or plan == "Owner":
+        return 0  # sin límites
+
+    limit = plan_limit(plan)
+    if limit <= 0:
+        return 0
+
+    with _conn() as conn:
+        active_now = conn.execute(
+            "SELECT COUNT(*) FROM pets WHERE user_id=? AND status='active'", (user_id,)
+        ).fetchone()
+        active_now = int(active_now[0] if active_now else 0)
+        if active_now >= limit:
+            return 0
+
+        need = limit - active_now
+        ids = _list_inactive_pet_ids_ordered(conn, user_id)[:need]
+        if not ids:
+            return 0
+
+        conn.executemany(
+            "UPDATE pets SET status='active', approved_at=datetime('now') WHERE id=?",
+            [(i,) for i in ids],
+        )
+        conn.commit()
+        return len(ids)
+
+def apply_plan_change_by_token(external_id: str, target_plan: str) -> tuple[bool, str | None, dict]:
+    """
+    Cambia el plan asociado a un token de 'purchases' (sin cobro), útil para downgrades/cancel.
+    Marca la purchase como 'paid' para cerrar el flujo.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, user_id, status FROM purchases WHERE external_id=?",
+            (external_id,)
+        ).fetchone()
+        if not row:
+            return False, "Orden no encontrada.", {}
+        pid, uid, status = row
+
+    ok, err, stats = change_user_plan(uid, target_plan)
+    if not ok:
+        return False, err, stats
+
+    with _conn() as conn:
+        conn.execute("UPDATE purchases SET status='paid' WHERE external_id=?", (external_id,))
+        conn.commit()
+
+    return True, None, stats

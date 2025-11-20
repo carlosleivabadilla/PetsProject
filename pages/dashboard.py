@@ -1,10 +1,13 @@
 # pages/dashboard.py
 import os
 import asyncio
+import json
+import urllib.request
+
 import flet as ft
 from services import db
 from ui.components import asset_image, card, page_preset, MUTED
-import json, urllib.request
+
 
 def _plan_next(current: str) -> str | None:
     """
@@ -17,6 +20,7 @@ def _plan_next(current: str) -> str | None:
     except ValueError:
         i = 0
     return order[i + 1] if i + 1 < len(order) else None
+
 
 def dashboard_view(page: ft.Page) -> ft.View:
     # Preset visual y DB
@@ -198,7 +202,6 @@ def dashboard_view(page: ft.Page) -> ft.View:
         except Exception:
             pass
         # 2) fallback a env var (por si usas run_public.ps1)
-        import os
         base = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
         return base or None
 
@@ -209,6 +212,7 @@ def dashboard_view(page: ft.Page) -> ft.View:
 
     def open_drawer():
         overlay.visible = True
+
         async def run():
             def step(p):
                 slide.margin = ft.margin.only(left=int(-PANEL_W * (1 - p)))
@@ -237,7 +241,6 @@ def dashboard_view(page: ft.Page) -> ft.View:
         close_drawer() if overlay.visible else open_drawer()
 
     # -------- Suscripción (AppBar acción arriba a la derecha) --------
-        # -------- Suscripción (AppBar acción arriba a la derecha) --------
     def manage_subscription(_):
         # Admin va al panel Owner
         if is_admin:
@@ -252,7 +255,6 @@ def dashboard_view(page: ft.Page) -> ft.View:
 
         # Siempre navega a la pantalla unificada de Suscripciones
         page.go("/subscriptions")
-
 
     # AppBar
     header = ft.AppBar(

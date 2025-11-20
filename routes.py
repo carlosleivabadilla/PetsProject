@@ -1,10 +1,11 @@
+# routes.py (o donde lo tengas)
 import flet as ft
 from pages.login import login_view
 from pages.register import register_view
 from pages.dashboard import dashboard_view
 from pages.pets import pets_view
 from pages.owner import owner_view
-from pages.subscription import subscription_view
+from pages.subscription import subscription_view  # ya lo tienes
 
 def setup_routes(page: ft.Page):
     def route_change(e: ft.RouteChangeEvent):
@@ -24,8 +25,16 @@ def setup_routes(page: ft.Page):
                 page.views.append(pets_view(page))
             elif page.route == "/owner":
                 page.views.append(owner_view(page))
+            # OJO: aquí elige una de estas dos según tu dashboard:
+
+            # Si en el dashboard haces page.go("/subscription"):
             elif page.route == "/subscription":
                 page.views.append(subscription_view(page))
+
+            # Si en el dashboard haces page.go("/subscriptions"):
+            # elif page.route == "/subscriptions":
+            #     page.views.append(subscription_view(page))
+
             else:
                 page.views.append(login_view(page))
 
@@ -39,7 +48,11 @@ def setup_routes(page: ft.Page):
                         ft.Container(
                             content=ft.Column(
                                 [
-                                    ft.Text("⚠️ Ocurrió un error al cargar la vista.", size=18, weight=ft.FontWeight.BOLD),
+                                    ft.Text(
+                                        "⚠️ Ocurrió un error al cargar la vista.",
+                                        size=18,
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
                                     ft.Text(str(ex), color="#DC2626"),
                                     ft.Text(tb, size=12, selectable=True, color="#6B7280"),
                                     ft.TextButton("Volver al login", on_click=lambda _: page.go("/login")),

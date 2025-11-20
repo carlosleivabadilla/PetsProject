@@ -51,11 +51,18 @@ def register_view(page: ft.Page) -> ft.View:
         )
 
         if success:
-            ok.value = "✅ Cuenta creada con plan Basic."
-            ok.visible = True
+            # Opción 1: volver al login
+            page.go("/login")
+
+            # Opción 2: auto-login y al dashboard:
+            # user = db.auth(email.value, pwd1.value)
+            # if user:
+            #     page.session.set("user", user)
+            #     page.go("/dashboard")
         else:
             err.value = f"Error: {error}"
             err.visible = True
+            page.update()
 
         page.update()
 

@@ -3,7 +3,8 @@ import flet as ft
 from ui.components import card, page_preset, MUTED
 from services import db
 
-PLANS = ["Basic", "Pro", "Owner"]
+# Planes que maneja la app (coinciden con db._PLAN_LIMITS)
+PLANS = ["Free", "Basic", "Plus", "Owner"]
 
 DEFAULT_PET = "/assets/dog.jpg"
 DEFAULT_PET_WEB = "/assets/dog.jpg"
@@ -122,7 +123,7 @@ def owner_view(page: ft.Page) -> ft.View:
                         content=ft.Row(
                             [
                                 ft.Container(
-                                    content=_img_from(photo, w=56, h=56),  # <-- SIN 'page'
+                                    content=_img_from(photo, w=56, h=56),
                                     width=56,
                                     height=56,
                                     border_radius=8,
@@ -132,6 +133,7 @@ def owner_view(page: ft.Page) -> ft.View:
                                     [
                                         ft.Text(name or "Sin nombre", weight=ft.FontWeight.BOLD),
                                         ft.Text(breed or "—", color=MUTED, size=12),
+                                        ft.Text(f"ID: {pid}", color=MUTED, size=11),  # <-- ID visible
                                         ft.Text(f"Solicitante: {uname or email or '—'}", color=MUTED, size=12),
                                         ft.Text(f"Solicitado: {reqat or '—'}", color=MUTED, size=12),
                                     ],
@@ -250,8 +252,7 @@ def owner_view(page: ft.Page) -> ft.View:
                         flash_ok(f"Mascota '{pname}' eliminada")
                         close_dlg()
                         open_pets(None)
-                    confirm("Eliminar mascota", f"¿Eliminar '{pname}'?", do_delete)
-
+                    confirm("Eliminar mascota", f"¿Eliminar '{pname}' (ID {pid})?", do_delete)
                 return handler
 
             def on_delete_all_click(_):
@@ -273,9 +274,18 @@ def owner_view(page: ft.Page) -> ft.View:
                     items.append(
                         ft.ListTile(
                             leading=_img_from(pphoto, w=38, h=38),
-                            title=ft.Row(
-                                [ft.Text(pname or "Sin nombre"), badge],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            title=ft.Column(
+                                [
+                                    ft.Row(
+                                        [
+                                            ft.Text(pname or "Sin nombre"),
+                                            badge,
+                                        ],
+                                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                    ),
+                                    ft.Text(f"ID: {pid}", size=11, color=MUTED),  # <-- ID visible
+                                ],
+                                spacing=2,
                             ),
                             subtitle=ft.Text(pbreed or ""),
                             trailing=ft.IconButton(

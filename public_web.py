@@ -1,9 +1,10 @@
 # public_web.py
 import os, mimetypes, html, base64, json
 from typing import Optional
-
+import urllib.request  # <-- agrega esto
 from fastapi import FastAPI, HTTPException, Response, Request, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from pydantic import BaseModel  # <-- IMPORTANTE para el body del POST
 from services import db
 
 DEFAULT_IMG_FS  = "assets/dog.jpg"
@@ -11,7 +12,7 @@ LOGO_PATH_FS    = "assets/logo_paw.png"
 
 app = FastAPI(title="PetProject Public")
 
-# ---------- utils (idénticas a tu versión previa) ----------
+# ---------- utils ----------
 
 def _read_file_bytes(path: str | None) -> bytes | None:
     if not path:
@@ -42,6 +43,44 @@ def _file_to_data_url(path: str) -> str | None:
 
 def _is_stripe_enabled() -> bool:
     return bool(os.environ.get("STRIPE_SECRET_KEY"))
+
+# ---------- MODELO Y ENDPOINT DE UBICACIÓN GPS ----------
+
+class LocationIn(BaseModel):
+    lat: float
+    lng: float
+
+@app.get("/static-map")
+def static_map(lat: float, lng: float, zoom: int = 15):
+    """
+    No descarga la imagen. Solo redirige a OpenStreetMap StaticMap.
+    El cliente (Flet / navegador) es quien hace la petición real.
+    """
+    size = "400x260"
+
+    url = (
+        "https://staticmap.openstreetmap.de/staticmap.php"
+        f"?center={lat},{lng}"
+        f"&zoom={zoom}"
+        f"&size={size}"
+        f"&markers={lat},{lng},red-pushpin"
+    )
+
+    # Redirigimos en vez de hacer urllib.request.urlopen(...)
+    return RedirectResponse(url)
+
+@app.post("/api/pets/{pet_id}/location")
+async def update_pet_location(pet_id: int, body: LocationIn):
+    """
+    Actualiza la última ubicación de la mascota según su ID.
+    JSON esperado: {"lat": -33.123, "lng": -70.567}
+    """
+    pet = db.get_pet(pet_id)
+    if not pet:
+        raise HTTPException(status_code=404, detail="Mascota no encontrada")
+
+    db.update_location_by_pet(pet_id, body.lat, body.lng)
+    return {"ok": True}
 
 # ---------- imagen pública ----------
 
@@ -322,7 +361,7 @@ def checkout_cancel(t: str):
 <p>Operación cancelada.</p>
 """)
 
-# --- NUEVO: Downgrade / Cancel (sin pago) ---
+# --- Downgrade / Cancel (sin pago) ---
 
 @app.get("/checkout/downgrade", response_class=HTMLResponse)
 def checkout_downgrade(t: str, to: str):
@@ -352,7 +391,7 @@ def checkout_downgrade(t: str, to: str):
 <p><a href="#" onclick="history.back()">Volver</a></p>
 """)
 
-# ---------- Stripe (opcional, igual que antes) ----------
+# ---------- Stripe (opcional) ----------
 
 @app.get("/checkout/create-stripe")
 def create_stripe_session(t: str, request: Request):
