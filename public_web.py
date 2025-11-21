@@ -9,6 +9,10 @@ from services import db
 
 DEFAULT_IMG_FS  = "assets/dog.jpg"
 LOGO_PATH_FS    = "assets/logo_paw.png"
+SMS_URL = os.getenv("SMS_GATEWAY_URL",
+                    "http://192.168.100.25:8080/send-sms")
+db.configure_sms_gateway(SMS_URL)
+
 
 app = FastAPI(title="PetProject Public")
 
@@ -99,6 +103,19 @@ def image_for_pet(pet_id: int):
         raise HTTPException(404, "Image not found")
 
     return Response(content=raw, media_type=ctype)
+
+@app.get("/api/pets/{pet_id}/geofence")
+def geofence_status(pet_id: int):
+    pet = db.get_pet(pet_id)
+    if not pet:
+        raise HTTPException(404, "Mascota no encontrada")
+    return {
+        "pet_id": pet_id,
+        "state": pet.get("geofence_state", "unknown"),
+        "last_lat": pet.get("last_lat"),
+        "last_lng": pet.get("last_lng"),
+        "last_at": pet.get("last_at"),
+    }
 
 # ---------- página pública del QR ----------
 

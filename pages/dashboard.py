@@ -3,6 +3,7 @@ import os
 import asyncio
 import json
 import urllib.request
+import urllib.parse  # <- para geocoding
 
 import flet as ft
 from services import db
@@ -20,6 +21,52 @@ def _plan_next(current: str) -> str | None:
     except ValueError:
         i = 0
     return order[i + 1] if i + 1 < len(order) else None
+
+
+def _geocode_address(address: str):
+    """
+    Usa Nominatim (OpenStreetMap) para obtener lat/lng de una dirección.
+    Devuelve (lat, lng) o (None, None) si falla o no encuentra resultados.
+    """
+    address = (address or "").strip()
+    if not address:
+        return None, None
+
+    try:
+        base_url = "https://nominatim.openstreetmap.org/search"
+        params = {
+            "q": address,
+            "format": "json",
+            "limit": 1,
+            "addressdetails": 1,
+            # limita resultados a Chile
+            "countrycodes": "cl",
+            # correo de contacto recomendado por Nominatim
+            "email": "carlosleiva309@gmail.com",
+        }
+        query = urllib.parse.urlencode(params)
+        url = f"{base_url}?{query}"
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                # pon el mismo correo aquí
+                "User-Agent": "carlosleiva309@gmail.com"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read().decode("utf-8"))
+
+        if not data:
+            return None, None
+
+        item = data[0]
+        lat = float(item["lat"])
+        lng = float(item["lon"])
+        return lat, lng
+    except Exception as e:
+        print("[Geocode] Error:", e)
+        return None, None
 
 
 def dashboard_view(page: ft.Page) -> ft.View:
@@ -77,29 +124,153 @@ def dashboard_view(page: ft.Page) -> ft.View:
             page.go("/login")
             return
 
-        name_field  = ft.TextField(label="Nombre",  value=session_user.get("name",""),  width=320)
-        phone_field = ft.TextField(label="Teléfono", value=session_user.get("phone",""), width=320)
-        msg_err = ft.Text("", color="#DC2626", visible=False)
+        # Valores actuales
+        cur_name    = session_user.get("name", "")
+        cur_phone   = session_user.get("phone", "")
+        cur_addr    = session_user.get("home_address", "")
+        cur_lat     = session_user.get("home_lat")
+        cur_lng     = session_user.get("home_lng")
 
-        def save(_):
-            name  = (name_field.value or "").strip()
-            phone = (phone_field.value or "").strip()
-            if not name and not phone:
-                msg_err.value = "Ingresa al menos un dato (nombre o teléfono)."
-                msg_err.visible = True
-                page.update()
-                return
+        # Campos de formulario
+        name_field  = ft.TextField(label="Nombre",  value=cur_name,  width=320)
+        phone_field = ft.TextField(label="Teléfono", value=cur_phone, width=320, hint_text="+569...")
+        addr_field  = ft.TextField(
+            label="Dirección de residencia",
+            value=cur_addr or "",
+            width=320,
+        )
 
-            db.update_user_profile(session_user["id"], name, phone)
-            session_user["name"]  = name
-            session_user["phone"] = phone
-            page.session.set("user", session_user)
+        lat_field = ft.TextField(
+            label="Latitud casa (opcional)",
+            value=f"{cur_lat:.6f}" if isinstance(cur_lat, (int, float)) else "",
+            width=155,
+        )
+        lng_field = ft.TextField(
+            label="Longitud casa (opcional)",
+            value=f"{cur_lng:.6f}" if isinstance(cur_lng, (int, float)) else "",
+            width=155,
+        )
 
-            shown = name if name else session_user.get("email","")
-            hdr_name_text.value   = f"Hola, {shown}"
-            main_title_text.value = f"¡Bienvenido {shown}!"
+        msg_ok  = ft.Text("", color="#059669", size=12, visible=False)
+        msg_err = ft.Text("", color="#DC2626", size=12, visible=False)
+
+        def show_ok(text: str):
+            msg_ok.value = text
+            msg_ok.visible = True
+            msg_err.visible = False
             page.update()
 
+        def show_err(text: str):
+            msg_err.value = text
+            msg_err.visible = True
+            msg_ok.visible = False
+            page.update()
+
+        geocode_in_progress = {"value": False}
+
+        def do_geocode(_):
+            """
+            Busca coordenadas para la dirección escrita y rellena lat/lng.
+            Se dispara desde el botón y también al presionar Enter en el campo.
+            """
+            if geocode_in_progress["value"]:
+                return
+
+            addr = (addr_field.value or "").strip()
+            if not addr:
+                show_err("Ingresa primero una dirección para buscar coordenadas.")
+                return
+
+            geocode_in_progress["value"] = True
+            show_ok("Buscando coordenadas...")
+            page.update()
+
+            lat, lng = _geocode_address(addr)
+
+            geocode_in_progress["value"] = False
+
+            if lat is None or lng is None:
+                show_err("No se encontraron coordenadas para esa dirección.")
+                return
+
+            lat_field.value = f"{lat:.6f}"
+            lng_field.value = f"{lng:.6f}"
+            show_ok("Coordenadas encontradas. Puedes ajustarlas antes de guardar.")
+            page.update()
+
+        # Enter en el campo de dirección dispara geocodificación
+        addr_field.on_submit = do_geocode
+
+        geocode_button = ft.TextButton(
+            "Obtener coordenadas desde dirección",
+            icon="my_location",
+            on_click=do_geocode,
+        )
+
+        def _parse_float(text: str, field_name: str):
+            t = (text or "").strip()
+            if not t:
+                return None
+            try:
+                # Por si el usuario escribe con coma
+                return float(t.replace(",", "."))
+            except ValueError:
+                raise ValueError(f"{field_name} debe ser un número válido.")
+
+        def save(_):
+            msg_ok.visible = False
+            msg_err.visible = False
+            msg_ok.value = ""
+            msg_err.value = ""
+            page.update()
+
+            name  = (name_field.value or "").strip()
+            phone = (phone_field.value or "").strip()
+            addr  = (addr_field.value or "").strip()
+
+            # Al menos un dato útil
+            if not name and not phone:
+                show_err("Ingresa al menos nombre o teléfono.")
+                return
+
+            try:
+                home_lat = _parse_float(lat_field.value, "Latitud")
+                home_lng = _parse_float(lng_field.value, "Longitud")
+            except ValueError as ex:
+                show_err(str(ex))
+                return
+
+            # Guardar perfil con geocerca
+            try:
+                db.update_user_profile(
+                    session_user["id"],
+                    name,
+                    phone,
+                    home_address=addr,
+                    home_lat=home_lat,
+                    home_lng=home_lng,
+                )
+            except Exception as ex:
+                show_err(f"No se pudo guardar el perfil: {ex}")
+                return
+
+            # Actualiza sesión
+            session_user["name"]         = name
+            session_user["phone"]        = phone
+            session_user["home_address"] = addr
+            session_user["home_lat"]     = home_lat
+            session_user["home_lng"]     = home_lng
+            page.session.set("user", session_user)
+
+            # Refrescamos textos del header
+            shown = name if name else session_user.get("email", "")
+            hdr_name_text.value   = f"Hola, {shown}"
+            main_title_text.value = f"¡Bienvenido {shown}!"
+            hdr_plan_text.value   = f"Plan: {session_user.get('plan', 'Basic')}"
+            page.update()
+
+            # Cerramos diálogo
+            show_ok("Perfil actualizado correctamente.")
             try:
                 page.close(dlg)
             except Exception:
@@ -116,16 +287,31 @@ def dashboard_view(page: ft.Page) -> ft.View:
         content = ft.Column(
             [
                 ft.Text("Editar perfil", size=18, weight=ft.FontWeight.BOLD),
-                name_field, phone_field,
+                name_field,
+                phone_field,
+                ft.Divider(),
+                ft.Text(
+                    "Residencia (para geocerca de 20 m):",
+                    size=12,
+                    color=MUTED,
+                ),
+                addr_field,
+                geocode_button,
+                ft.Row([lat_field, lng_field], spacing=8),
                 ft.Row(
-                    [ft.ElevatedButton("Guardar", on_click=save),
-                     ft.TextButton("Cancelar", on_click=cancel)],
+                    [
+                        ft.ElevatedButton("Guardar", on_click=save),
+                        ft.TextButton("Cancelar", on_click=cancel),
+                    ],
                     alignment=ft.MainAxisAlignment.END,
                 ),
+                msg_ok,
                 msg_err,
             ],
-            spacing=10, width=360,
+            spacing=10,
+            width=360,
         )
+
         dlg = ft.AlertDialog(content=content, modal=True)
         try:
             page.open(dlg)

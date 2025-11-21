@@ -51,18 +51,11 @@ def register_view(page: ft.Page) -> ft.View:
         )
 
         if success:
-            # Opción 1: volver al login
-            page.go("/login")
-
-            # Opción 2: auto-login y al dashboard:
-            # user = db.auth(email.value, pwd1.value)
-            # if user:
-            #     page.session.set("user", user)
-            #     page.go("/dashboard")
+            ok.value = "✅ Cuenta creada con plan Basic."
+            ok.visible = True
         else:
             err.value = f"Error: {error}"
             err.visible = True
-            page.update()
 
         page.update()
 
@@ -85,6 +78,15 @@ def register_view(page: ft.Page) -> ft.View:
         spacing=12,
         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
     )
-    container = card(content)
-    container.width = 420
-    return ft.View("/register", controls=[ft.Container(container, alignment=ft.alignment.center)])
+
+    card_container = card(content)
+    card_container.width = 420
+
+    # ⬇️ CENTRADO VERTICAL Y HORIZONTAL
+    root = ft.Container(
+        content=card_container,
+        expand=True,
+        alignment=ft.alignment.center,
+    )
+
+    return ft.View("/register", controls=[root])

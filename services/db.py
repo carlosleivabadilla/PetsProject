@@ -1,8 +1,96 @@
 # services/db.py
 import sqlite3, os, hashlib, uuid, secrets
-import json, urllib.request  # <- agrega esto
+import json, urllib.request
+import math
+try:
+    import requests  # <-- para llamar a tu gateway SMS
+except Exception:
+    requests = None
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "app.db")
+
+# ========== Configuración SMS ==========
+
+_SMS_GATEWAY_URL: str|None = None
+
+def configure_sms_gateway(url: str|None=None):
+    global _SMS_GATEWAY_URL
+    if url:
+        _SMS_GATEWAY_URL = url.strip()
+
+def _get_sms_url()->str:
+    global _SMS_GATEWAY_URL
+
+    url = (_SMS_GATEWAY_URL or "").strip()
+
+    if not url:
+        url = os.environ.get("SMS_GATEWAY_URL","").strip()
+
+    if not url:
+        try:
+            with open("SMS_GATEWAY.json","r",encoding="utf-8") as f:
+                data = json.load(f)
+            url = (data.get("url") or "").strip()
+        except Exception:
+            pass
+    return url
+
+def _send_sms(phone: str, text: str) -> bool:
+    """
+    Envía un SMS usando tu Simple SMS Gateway.
+
+    - Usa SMS_GATEWAY_URL desde variables de entorno.
+    - Formato esperado por tu servidor:
+        POST { "phone": "...", "message": "..." } como JSON.
+    - Devuelve True si aparentemente salió bien, False si falló.
+    """
+    url = _get_sms_url()
+
+    if not url:
+        print("[SMS] SMS_GATEWAY_URL no configurado; no se envía nada.")
+        return False
+
+    phone = (phone or "").strip()
+    text = (text or "").strip()
+    if not phone or not text:
+        print("[SMS] Teléfono o texto vacíos; no se envía nada.")
+        return False
+
+    payload = {
+        "phone": phone,   # número que viene del perfil del usuario
+        "message": text,  # texto del aviso
+    }
+
+    try:
+        # 1) Si tenemos 'requests' (PC/backend), úsalo
+        if requests is not None:
+            resp = requests.post(url, json=payload, timeout=5)
+            if resp.status_code >= 400:
+                print(f"[SMS] Error {resp.status_code}: {resp.text}")
+                return False
+
+            print("[SMS] Enviado vía requests:", resp.status_code, resp.text[:200])
+            return True
+
+        # 2) Fallback para Android: urllib.request (lib estándar)
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = getattr(resp, "status", resp.getcode())
+            body = resp.read().decode("utf-8", errors="ignore")
+            if status >= 400:
+                print(f"[SMS] Error {status}: {body[:200]}")
+                return False
+
+            print("[SMS] Enviado vía urllib:", status, body[:200])
+        return True
+
+    except Exception as e:
+        print("[SMS] Error enviando SMS:", e)
+        return False
 
 def _conn():
     conn = sqlite3.connect(DB_PATH)
@@ -25,33 +113,134 @@ def _ensure_user_columns(c):
         c.execute("ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'Free'")
     if "role" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+    # ubicación de residencia para geocerca
+    if "home_lat" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN home_lat REAL")
+    if "home_lng" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN home_lng REAL")
+    if "home_address" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN home_address TEXT")
 
 def _ensure_pets_columns(c):
     cols = {r[1] for r in c.execute("PRAGMA table_info(pets)").fetchall()}
+
     if "user_id" not in cols:
         c.execute("ALTER TABLE pets ADD COLUMN user_id INTEGER")
+
     if "status" not in cols:
         c.execute("ALTER TABLE pets ADD COLUMN status TEXT DEFAULT 'active'")
-    if "requested_by" not in cols:
-        c.execute("ALTER TABLE pets ADD COLUMN requested_by INTEGER")
-    if "requested_at" not in cols:
-        c.execute("ALTER TABLE pets ADD COLUMN requested_at TEXT")
-    if "approved_by" not in cols:
-        c.execute("ALTER TABLE pets ADD COLUMN approved_by INTEGER")
-    if "approved_at" not in cols:
-        c.execute("ALTER TABLE pets ADD COLUMN approved_at TEXT")
-    # tracker y última ubicación
+
     if "tracker_code" not in cols:
         c.execute("ALTER TABLE pets ADD COLUMN tracker_code TEXT")
+
     if "last_lat" not in cols:
         c.execute("ALTER TABLE pets ADD COLUMN last_lat REAL")
+
     if "last_lng" not in cols:
         c.execute("ALTER TABLE pets ADD COLUMN last_lng REAL")
+
     if "last_at" not in cols:
         c.execute("ALTER TABLE pets ADD COLUMN last_at TEXT")
-    # token QR persistente (sin UNIQUE aquí)
+
+    if "requested_by" not in cols:
+        c.execute("ALTER TABLE pets ADD COLUMN requested_by INTEGER")
+
+    if "requested_at" not in cols:
+        c.execute("ALTER TABLE pets ADD COLUMN requested_at TEXT")
+
+    if "approved_by" not in cols:
+        c.execute("ALTER TABLE pets ADD COLUMN approved_by INTEGER")
+
+    if "approved_at" not in cols:
+        c.execute("ALTER TABLE pets ADD COLUMN approved_at TEXT")
+
     if "qr_token" not in cols:
         c.execute("ALTER TABLE pets ADD COLUMN qr_token TEXT")
+
+    # estado de geocerca (inside / outside / unknown)
+    if "geofence_state" not in cols:
+        c.execute("ALTER TABLE pets ADD COLUMN geofence_state TEXT DEFAULT 'unknown'")
+
+# =========================
+# Geocerca + SMS
+# =========================
+
+def _haversine_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Distancia aproximada entre 2 puntos (lat/lon en grados) en metros.
+    """
+    R = 6371000.0  # radio terrestre en metros
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def _check_geofence_and_notify(conn, pet_id: int, user_id: int, lat: float, lng: float):
+    """
+    Comprueba si la mascota salió de la geocerca y, si cambia de estado 'inside' -> 'outside',
+    envía una notificación por SMS usando tu gateway local.
+    """
+    c = conn.cursor()
+
+    # 1) Datos de usuario (residencia + teléfono)
+    row_u = c.execute(
+        "SELECT home_lat, home_lng, phone, name FROM users WHERE id=?",
+        (user_id,)
+    ).fetchone()
+    if not row_u:
+        return
+
+    home_lat, home_lng, phone, owner_name = row_u
+
+    if home_lat is None or home_lng is None:
+        # No hay geocerca configurada
+        return
+    phone = (phone or "").strip()
+    if not phone:
+        # No hay teléfono para notificar
+        return
+
+    # 2) Estado previo de geocerca
+    row_p = c.execute(
+        "SELECT geofence_state, name FROM pets WHERE id=?",
+        (pet_id,)
+    ).fetchone()
+    if not row_p:
+        return
+
+    prev_state, pet_name = row_p
+    prev_state = (prev_state or "unknown").lower()
+    pet_name = pet_name or "tu mascota"
+
+    # 3) Distancia actual
+    dist_m = _haversine_distance_m(home_lat, home_lng, lat, lng)
+    RADIUS = 20.0  # metros
+
+    new_state = "inside" if dist_m <= RADIUS else "outside"
+
+    # 4) Si no cambió de estado, no hacemos nada
+    if new_state == prev_state:
+        return
+
+    # 5) Actualiza estado
+    c.execute(
+        "UPDATE pets SET geofence_state=? WHERE id=?",
+        (new_state, pet_id)
+    )
+    conn.commit()
+
+    # 6) Si acaba de salir (inside/unknown -> outside), enviamos SMS
+    if new_state == "outside":
+        msg = (
+            f"⚠️ {pet_name} salió de la zona segura.\n"
+            f"Distancia aproximada a casa: {dist_m:.1f} m."
+        )
+        _send_sms(phone, msg)
 
 def _backfill_qr_tokens(c):
     """Asigna qr_token a las mascotas que aún no lo tengan."""
@@ -107,7 +296,10 @@ def init_db():
 
         # seed admin
         admin_email = "admin@admin.cl"
-        exists = c.execute("SELECT 1 FROM users WHERE email=?", (admin_email,)).fetchone()
+        exists = c.execute(
+            "SELECT 1 FROM users WHERE email=?",
+            (admin_email,)      # ← coma al final: esto SÍ es una tupla de 1 elemento
+        ).fetchone()
         if not exists:
             c.execute(
                 "INSERT INTO users(email, password_hash, plan, role, name, phone) VALUES(?,?,?,?,?,?)",
@@ -206,14 +398,29 @@ def can_user_downgrade_to(user_id: int, new_plan: str) -> tuple[bool, str | None
 def auth(email: str, password: str):
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, email, plan, role, name, phone, password_hash FROM users WHERE email=?",
+            """
+            SELECT id, email, plan, role, name, phone, home_address, home_lat, home_lng, password_hash
+              FROM users
+             WHERE email=?
+            """,
             (email.strip().lower(),)
         ).fetchone()
         if not row:
             return None
-        uid, em, plan, role, name, phone, pwh = row
-        return {"id": uid, "email": em, "plan": plan, "role": role, "name": name or "", "phone": phone or ""} \
-            if pwh == _hash(password) else None
+        uid, em, plan, role, name, phone, home_address, home_lat, home_lng, pwh = row
+        if pwh != _hash(password):
+            return None
+        return {
+            "id": uid,
+            "email": em,
+            "plan": (plan or "Free").strip(),
+            "role": role or "user",
+            "name": name or "",
+            "phone": phone or "",
+            "home_address": home_address or "",
+            "home_lat": home_lat,
+            "home_lng": home_lng,
+        }
 
 def register(email: str, password: str, name: str, phone: str):
     with _conn() as conn:
@@ -254,12 +461,49 @@ def attach_orphan_pets_to_user(user_id: int) -> int:
         conn.commit()
         return cur.rowcount
 
-def update_user_profile(user_id: int, name: str, phone: str):
+def update_user_profile(
+    user_id: int,
+    name: str,
+    phone: str,
+    home_address: str | None = None,
+    home_lat: float | None = None,
+    home_lng: float | None = None,
+):
+    """
+    Actualiza perfil del usuario.
+    - Si no se pasan home_* se actualiza solo nombre/teléfono (compatibilidad).
+    - Si se pasan home_* se guardan también dirección y coordenadas.
+    """
+    name  = (name or "").strip()
+    phone = (phone or "").strip()
+
     with _conn() as conn:
-        conn.execute(
-            "UPDATE users SET name=?, phone=? WHERE id=?",
-            ((name or "").strip(), (phone or "").strip(), user_id)
-        )
+        if home_address is None and home_lat is None and home_lng is None:
+            # Modo antiguo (solo nombre/teléfono)
+            conn.execute(
+                "UPDATE users SET name=?, phone=? WHERE id=?",
+                (name, phone, user_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE users
+                   SET name=?,
+                       phone=?,
+                       home_address=?,
+                       home_lat=?,
+                       home_lng=?
+                 WHERE id=?
+                """,
+                (
+                    name,
+                    phone,
+                    (home_address or "").strip(),
+                    home_lat,
+                    home_lng,
+                    user_id,
+                ),
+            )
         conn.commit()
 
 def delete_user_and_pets(user_id: int):
@@ -278,23 +522,29 @@ def delete_user_pets(user_id: int):
         conn.commit()
 
 def get_user_by_id(user_id: int):
-    """Devuelve el usuario “fresco” desde la BD (id, email, plan, role, name, phone)."""
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, email, plan, role, name, phone FROM users WHERE id=?",
+            """
+            SELECT id, email, plan, role, name, phone, home_address, home_lat, home_lng
+              FROM users
+             WHERE id=?
+            """,
             (user_id,)
         ).fetchone()
-        if not row:
-            return None
-        uid, email, plan, role, name, phone = row
-        return {
-            "id": uid,
-            "email": email,
-            "plan": plan or "Free",
-            "role": role or "user",
-            "name": name or "",
-            "phone": phone or "",
-        }
+    if not row:
+        return None
+    uid, email, plan, role, name, phone, home_address, home_lat, home_lng = row
+    return {
+        "id": uid,
+        "email": email,
+        "plan": (plan or "Free").strip(),
+        "role": role or "user",
+        "name": name or "",
+        "phone": phone or "",
+        "home_address": home_address or "",
+        "home_lat": home_lat,
+        "home_lng": home_lng,
+    }
 
 # =========================
 # Pets (con estados)
@@ -490,13 +740,38 @@ def get_public_pet_info_by_token(token: str):
 def get_pet(pid: int):
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, name, breed, photo, tracker_code, last_lat, last_lng, last_at FROM pets WHERE id=?",
-            (pid,)
+            """
+            SELECT
+                id,
+                name,
+                breed,
+                photo,
+                tracker_code,
+                last_lat,
+                last_lng,
+                last_at,
+                geofence_state
+            FROM pets
+            WHERE id=?
+            """,
+            (pid,),
         ).fetchone()
-        if not row:
-            return None
-        keys = ["id","name","breed","photo","tracker_code","last_lat","last_lng","last_at"]
-        return dict(zip(keys, row))
+
+    if not row:
+        return None
+
+    keys = [
+        "id",
+        "name",
+        "breed",
+        "photo",
+        "tracker_code",
+        "last_lat",
+        "last_lng",
+        "last_at",
+        "geofence_state",
+    ]
+    return dict(zip(keys, row))
 
 def set_pet_tracker(pid: int, tracker_code: str | None):
     with _conn() as conn:
@@ -505,19 +780,43 @@ def set_pet_tracker(pid: int, tracker_code: str | None):
 
 def update_location_by_pet(pid: int, lat: float, lng: float):
     with _conn() as conn:
-        conn.execute(
+        c = conn.cursor()
+        # Actualiza ubicación
+        c.execute(
             "UPDATE pets SET last_lat=?, last_lng=?, last_at=datetime('now') WHERE id=?",
             (lat, lng, pid)
         )
+        # Obtenemos el user_id para geocerca
+        row = c.execute("SELECT user_id FROM pets WHERE id=?", (pid,)).fetchone()
         conn.commit()
+
+        if row and row[0]:
+            try:
+                _check_geofence_and_notify(conn, pet_id=pid, user_id=row[0], lat=lat, lng=lng)
+            except Exception as ex:
+                print("[Geofence] Error en update_location_by_pet:", ex)
 
 def update_location_by_tracker(tracker_code: str, lat: float, lng: float):
     with _conn() as conn:
-        conn.execute(
+        c = conn.cursor()
+        # Actualiza ubicación
+        c.execute(
             "UPDATE pets SET last_lat=?, last_lng=?, last_at=datetime('now') WHERE tracker_code=?",
             (lat, lng, tracker_code)
         )
+        # Buscamos la mascota asociada al tracker
+        row = c.execute(
+            "SELECT id, user_id FROM pets WHERE tracker_code=?",
+            (tracker_code,)
+        ).fetchone()
         conn.commit()
+
+        if row and row[0] and row[1]:
+            pid, uid = row
+            try:
+                _check_geofence_and_notify(conn, pet_id=pid, user_id=uid, lat=lat, lng=lng)
+            except Exception as ex:
+                print("[Geofence] Error en update_location_by_tracker:", ex)
 
 def get_pet_with_owner(pid: int):
     """Mascota + dueño."""
@@ -619,7 +918,6 @@ def mark_purchase_paid(external_id: str) -> tuple[bool, str | None]:
 
     return True, None
 
-
 def cancel_purchase(external_id: str):
     with _conn() as conn:
         conn.execute("UPDATE purchases SET status='canceled' WHERE external_id=?", (external_id,))
@@ -657,7 +955,6 @@ def _autodetect_public_base() -> str:
 
     return ""
 
-# --- agrega al final de db.py (o junto a las funciones de QR) ---
 def get_or_create_qr_token(pet_id: int) -> str:
     """Devuelve el qr_token estable; si no existe, lo crea y lo persiste."""
     with _conn() as conn:
@@ -828,43 +1125,6 @@ def change_user_plan(user_id: int, new_plan: str) -> tuple[bool, str | None, dic
         "final_plan": new_plan,
     }
 
-def reactivate_up_to_plan_limit(user_id: int, plan: str | None = None) -> int:
-    """
-    Reactiva, si corresponde, mascotas 'inactive' hasta completar el cupo del plan.
-    Devuelve cuántas se reactivaron.
-    """
-    if plan is None:
-        plan, role = _get_user_plan_role(user_id)
-    else:
-        role = _get_user_plan_role(user_id)[1]
-
-    if role == "admin" or plan == "Owner":
-        return 0  # sin límites
-
-    limit = plan_limit(plan)
-    if limit <= 0:
-        return 0
-
-    with _conn() as conn:
-        active_now = conn.execute(
-            "SELECT COUNT(*) FROM pets WHERE user_id=? AND status='active'", (user_id,)
-        ).fetchone()
-        active_now = int(active_now[0] if active_now else 0)
-        if active_now >= limit:
-            return 0
-
-        need = limit - active_now
-        ids = _list_inactive_pet_ids_ordered(conn, user_id)[:need]
-        if not ids:
-            return 0
-
-        conn.executemany(
-            "UPDATE pets SET status='active', approved_at=datetime('now') WHERE id=?",
-            [(i,) for i in ids],
-        )
-        conn.commit()
-        return len(ids)
-
 def apply_plan_change_by_token(external_id: str, target_plan: str) -> tuple[bool, str | None, dict]:
     """
     Cambia el plan asociado a un token de 'purchases' (sin cobro), útil para downgrades/cancel.
@@ -872,8 +1132,7 @@ def apply_plan_change_by_token(external_id: str, target_plan: str) -> tuple[bool
     """
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, user_id, status FROM purchases WHERE external_id=?",
-            (external_id,)
+            "SELECT id, user_id, status FROM purchases WHERE external_id=?", (external_id,)
         ).fetchone()
         if not row:
             return False, "Orden no encontrada.", {}

@@ -183,7 +183,7 @@ def owner_view(page: ft.Page) -> ft.View:
         visible=(orphans > 0),
     )
 
-    users_list = ft.ListView(spacing=10, expand=1, padding=0)
+    users_list = ft.ListView(spacing=10, padding=0)
 
     def confirm(title: str, message: str, on_yes):
         dlg = ft.AlertDialog(
@@ -448,6 +448,7 @@ def owner_view(page: ft.Page) -> ft.View:
             ),
         ],
         spacing=12,
+        scroll=ft.ScrollMode.AUTO,   # <- clave para poder scrollear
     )
 
     header = ft.AppBar(
@@ -456,8 +457,15 @@ def owner_view(page: ft.Page) -> ft.View:
         bgcolor="#FFFFFF",
     )
 
+    root = ft.Container(
+        content=content,
+        alignment=ft.alignment.top_center,
+        padding=12,
+        expand=True,  # <- ocupa todo el alto de la vista
+    )
+
     return ft.View(
         "/owner",
         appbar=header,
-        controls=[ft.Container(content, alignment=ft.alignment.top_center, padding=12)],
+        controls=[root],
     )

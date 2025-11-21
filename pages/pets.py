@@ -233,82 +233,57 @@ def _pets_impl(page: ft.Page) -> ft.View:
             url = "https://chart.googleapis.com/chart?cht=qr&chs=" + f"{size}x{size}" + "&chl=" + _url.quote(text)
             return ft.Image(src=url, width=size, height=size)
 
-    def open_map(pid: int):
+    def open_qr(pid: int):
         """
-        Muestra un mapa PRECISO usando un WebView con OpenStreetMap embebido
-        y un botón para abrir la misma ubicación en Google Maps.
-        NO pasa por /static-map ni por tu servidor para el mapa.
+        Genera el QR de la mascota usando SIEMPRE el backend:
+        db.get_pet_qr_payload(pid) ya se encarga de detectar dinámicamente
+        la URL pública (ngrok / PUBLIC_BASE_URL / archivo).
         """
-        # Coordenadas por defecto (Santiago) si la mascota aún no tiene ubicación
-        lat, lng = -33.4489, -70.6693
         try:
-            if hasattr(db, "get_pet"):
-                info = db.get_pet(pid) or {}
-                if info.get("last_lat") is not None and info.get("last_lng") is not None:
-                    lat = float(info.get("last_lat"))
-                    lng = float(info.get("last_lng"))
-        except Exception:
-            pass
+            payload = db.get_pet_qr_payload(pid)
+        except Exception as ex:
+            payload = f"ERROR: {ex}"
 
-        # Link a Google Maps con la ubicación real
-        gmaps_link = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
-
-        # ---------- URL embebida de OpenStreetMap ----------
-        # Calculamos una bbox pequeñita alrededor del punto
-        dlat = 0.01
-        dlng = 0.01
-        left   = lng - dlng
-        bottom = lat - dlat
-        right  = lng + dlng
-        top    = lat + dlat
-
-        bbox = f"{left},{bottom},{right},{top}"
-        # Mapa embebido con marcador en la posición de la mascota
-        osm_embed_url = (
-            "https://www.openstreetmap.org/export/embed.html"
-            f"?bbox={_url.quote(bbox)}"
-            f"&layer=mapnik"
-            f"&marker={lat},{lng}"
-        )
-
-        # WebView con el mapa (preciso y cargado directamente desde OSM)
-        map_view = ft.WebView(
-            url=osm_embed_url,
-            width=420,
-            height=280,
-        )
+        img = _qr_image_for(payload, size=240)
 
         dlg = ft.AlertDialog(
-            title=ft.Text("Ubicación"),
+            title=ft.Text("QR de la mascota"),
             content=ft.Column(
                 [
-                    map_view,
-                    ft.Text(
-                        f"Lat/Lng: {lat:.6f}, {lng:.6f}",
-                        size=11,
-                        color=MUTED,
-                    ),
-                    ft.Row(
-                        [
-                            ft.FilledButton(
-                                "Abrir en Google Maps",
-                                icon="open_in_new",
-                                on_click=lambda e: page.launch_url(gmaps_link),
-                            )
-                        ],
-                        alignment=ft.MainAxisAlignment.END,
-                    ),
+                    ft.Container(content=img, alignment=ft.alignment.center),
+                    ft.Text(payload, size=12, color=MUTED, selectable=True),
                 ],
                 spacing=10,
-                width=440,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                width=280,
             ),
-            actions=[
-                ft.TextButton("Cerrar", on_click=lambda e: _close_dialog(page, dlg)),
-            ],
+            actions=[ft.TextButton("Cerrar", on_click=lambda e: _close_dialog(page, dlg))],
             actions_alignment=ft.MainAxisAlignment.END,
             modal=True,
         )
         _open_dialog(page, dlg)
+
+    def open_map(pid: int):
+        """
+        Abre directamente Google Maps en la última ubicación conocida de la mascota.
+        Sin pop-up dentro de la app.
+        """
+        # Coordenadas por defecto (Santiago) por si no hay datos
+        lat, lng = -33.4489, -70.6693
+
+        try:
+            if hasattr(db, "get_pet"):
+                info = db.get_pet(pid) or {}
+                if info.get("last_lat") is not None and info.get("last_lng") is not None:
+                    lat = float(info["last_lat"])
+                    lng = float(info["last_lng"])
+        except Exception:
+            # Si algo falla, usamos las coords por defecto
+            pass
+
+        # Link directo a Google Maps
+        gmaps_link = f"https://maps.google.com/?q={lat},{lng}&z=16"
+        page.launch_url(gmaps_link)
 
     # ------- Diálogo: Renombrar -------
 
@@ -369,6 +344,31 @@ def _pets_impl(page: ft.Page) -> ft.View:
                 border_radius=100,
             )
         return ft.Container()
+    
+    def _geofence_chip(state: str | None) -> ft.Control:
+        s = (state or "").lower()
+
+        if s == "inside":
+            return ft.Container(
+                ft.Text("Dentro de casa", color="#065f46", size=11),
+                bgcolor="#d1fae5",
+                padding=ft.padding.symmetric(3, 6),
+                border_radius=100,
+            )
+        if s == "outside":
+            return ft.Container(
+                ft.Text("Fuera de geocerca", color="#b91c1c", size=11),
+                bgcolor="#fee2e2",
+                padding=ft.padding.symmetric(3, 6),
+                border_radius=100,
+            )
+        # default / unknown
+        return ft.Container(
+            ft.Text("Sin datos", color="#6b7280", size=11),
+            bgcolor="#e5e7eb",
+            padding=ft.padding.symmetric(3, 6),
+            border_radius=100,
+        )
 
     def _pet_tile(pid: int, name: str, breed: str, photo: str | None, status: str = "active") -> ft.Control:
         hero_img = image_from_photo(page, photo, height=200, fit=ft.ImageFit.COVER)
@@ -387,18 +387,37 @@ def _pets_impl(page: ft.Page) -> ft.View:
         s = (status or "").lower()
         is_active = (s == "active")
 
-        title_row = ft.Row(
+        # Obtener estado geocerca desde DB
+        g_state = None
+        try:
+            info = db.get_pet(pid)
+            g_state = info.get("geofence_state")
+        except Exception:
+            pass
+
+        title_row = ft.Column(
             [
-                ft.Text(
-                    name or "Sin nombre",
-                    weight=ft.FontWeight.BOLD,
-                    overflow=ft.TextOverflow.ELLIPSIS,
-                    expand=True,
+                ft.Row(
+                    [
+                        ft.Text(
+                            name or "Sin nombre",
+                            weight=ft.FontWeight.BOLD,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            expand=True,
+                        ),
+                        _status_chip(status),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
-                _status_chip(status),
+                ft.Row(
+                    [
+                        _geofence_chip(g_state),
+                    ],
+                    alignment=ft.MainAxisAlignment.START,
+                ),
             ],
-            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=4,
         )
 
         # Botones: activos solo si la mascota está activa
@@ -411,7 +430,6 @@ def _pets_impl(page: ft.Page) -> ft.View:
                 on_click=lambda e, _pid=pid, _n=name: open_rename_dialog(_pid, _n),
             )
         else:
-            # Inactiva → botones deshabilitados, sin on_click
             map_btn = ft.FilledButton("Mapa", icon="location_on", disabled=True)
             qr_btn = ft.FilledButton("QR", icon="qr_code_2", disabled=True)
             rename_btn = ft.OutlinedButton("Renombrar", icon="edit", disabled=True)
@@ -719,10 +737,10 @@ def pets_view(page: ft.Page) -> ft.View:
 
 def _current_public_base() -> str | None:
     """
-    Devuelve la URL pública HTTPS de ngrok si está corriendo (via API 4040).
-    Si no hay ngrok, intenta PUBLIC_BASE_URL. Si nada, None.
+    (Ya casi no se usa para QR) Devuelve la URL pública HTTPS de ngrok si está
+    corriendo (via API 4040). Si no hay ngrok, intenta PUBLIC_BASE_URL.
+    Se mantiene por si quieres reusarlo en otros sitios.
     """
-    # 1) ngrok local API
     try:
         with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
             j = json.loads(r.read().decode("utf-8"))
@@ -732,6 +750,5 @@ def _current_public_base() -> str | None:
     except Exception:
         pass
 
-    # 2) fallback: variable de entorno (por si usas run_public.ps1)
     base = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
     return base or None

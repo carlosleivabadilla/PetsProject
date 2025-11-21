@@ -67,6 +67,14 @@ def login_view(page: ft.Page) -> ft.View:
         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
     )
 
-    container = card(content)
-    container.width = 420
-    return ft.View("/login", controls=[ft.Container(container, alignment=ft.alignment.center)])
+    card_container = card(content)
+    card_container.width = 420
+
+    # ⬇️ CENTRADO VERTICAL Y HORIZONTAL
+    root = ft.Container(
+        content=card_container,
+        expand=True,
+        alignment=ft.alignment.center,
+    )
+
+    return ft.View("/login", controls=[root])
